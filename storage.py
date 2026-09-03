@@ -62,6 +62,20 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS idx_seen_items_search
                     ON seen_items (search_id);
+
+                CREATE TABLE IF NOT EXISTS pending_digest (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    search_name TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    photo_url TEXT,
+                    caption TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    added_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pending_digest_chat
+                    ON pending_digest (chat_id);
                 """
             )
             conn.commit()
@@ -182,6 +196,59 @@ class Storage:
                 "VALUES (?, ?, ?)",
                 [(search_id, iid, now) for iid in item_ids],
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ---------------------------------------------------------------
+    # Coda per il riepilogo mattutino ("modalità notturna silenziosa")
+    # ---------------------------------------------------------------
+
+    def add_pending_item(
+        self,
+        chat_id: int,
+        search_name: str,
+        item_id: str,
+        photo_url: str,
+        caption: str,
+        price: float,
+    ) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO pending_digest "
+                "(chat_id, search_name, item_id, photo_url, caption, price, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, search_name, item_id, photo_url, caption, price, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_chats_with_pending(self) -> list[int]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT chat_id FROM pending_digest"
+            ).fetchall()
+            return [r["chat_id"] for r in rows]
+        finally:
+            conn.close()
+
+    def get_pending_items(self, chat_id: int) -> list[sqlite3.Row]:
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM pending_digest WHERE chat_id = ? ORDER BY price ASC",
+                (chat_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def clear_pending_items(self, chat_id: int) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM pending_digest WHERE chat_id = ?", (chat_id,))
             conn.commit()
         finally:
             conn.close()

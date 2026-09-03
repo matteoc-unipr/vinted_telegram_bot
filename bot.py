@@ -11,6 +11,11 @@ Comandi:
   /pausa <id>           Mette in pausa una ricerca (senza eliminarla)
   /riprendi <id>        Riattiva una ricerca in pausa
 
+Il bot continua a controllare Vinted 24 ore su 24. Durante le "ore
+silenziose" (configurabili, default 23:00-09:00) non invia notifiche
+singole: raccoglie gli annunci trovati e li invia tutti insieme come
+riepilogo appena finisce l'orario silenzioso.
+
 Configurazione tramite variabili d'ambiente: vedi .env.example.
 
 Avvio:
@@ -24,8 +29,10 @@ import logging
 import os
 import random
 import re
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote_plus
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -54,6 +61,16 @@ ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "20"))
 ALLOWED_CHAT_IDS = {
     int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()
 }
+
+# Ore silenziose: fuori da questo intervallo il bot invia le notifiche
+# normalmente; dentro questo intervallo raccoglie gli annunci senza
+# notificarli e li invia come riepilogo unico appena l'orario finisce.
+# Usa il fuso orario indicato in TIMEZONE, non quello del server (utile
+# perché molte VM cloud girano di default in UTC).
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Rome"))
+QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "23"))  # 23 = 23:00
+QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "9"))  # 9 = 09:00
+DIGEST_MAX_ITEMS = int(os.environ.get("DIGEST_MAX_ITEMS", "20"))
 
 VINTED_URL_RE = re.compile(r"https?://(www\.)?vinted\.[a-z.]+/catalog\?", re.IGNORECASE)
 
@@ -213,10 +230,77 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _set_active_cmd(update, context, active=True)
 
 
+def is_quiet_hours(now: datetime | None = None) -> bool:
+    """True se l'ora locale attuale (fuso TIMEZONE) rientra nell'intervallo
+    silenzioso. Gestisce anche il caso in cui l'intervallo attraversi la
+    mezzanotte (es. 23 -> 9)."""
+    hour = (now or datetime.now(TIMEZONE)).hour
+    start, end = QUIET_HOURS_START, QUIET_HOURS_END
+    if start == end:
+        return False  # intervallo nullo: mai silenzioso
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end  # attraversa la mezzanotte
+
+
+async def _send_item_notification(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, photo_url: str, caption: str
+) -> None:
+    try:
+        if photo_url:
+            await context.bot.send_photo(
+                chat_id=chat_id, photo=photo_url, caption=caption, parse_mode=ParseMode.HTML
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("Errore inviando una notifica alla chat %s", chat_id)
+
+
+async def _flush_pending_digests(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Invia, se presenti, gli annunci raccolti durante le ore silenziose.
+    Va chiamata a inizio ciclo quando NON siamo più in orario silenzioso,
+    così il riepilogo parte al primo controllo utile dopo la fine della
+    notte, senza bisogno di un job separato a orario fisso."""
+    for chat_id in storage.list_chats_with_pending():
+        rows = storage.get_pending_items(chat_id)
+        if not rows:
+            continue
+
+        to_send = rows[:DIGEST_MAX_ITEMS]  # già ordinati per prezzo crescente
+        extra = len(rows) - len(to_send)
+
+        intro = f"☀️ Buongiorno! Durante la notte ho trovato {len(rows)} nuovi annunci"
+        intro += f", te ne mostro i {len(to_send)} più convenienti:" if extra > 0 else ":"
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=intro)
+        except Exception:
+            logger.exception("Errore inviando l'intro del riepilogo alla chat %s", chat_id)
+
+        for row in to_send:
+            await _send_item_notification(context, chat_id, row["photo_url"], row["caption"])
+            await asyncio.sleep(1.5)
+
+        storage.clear_pending_items(chat_id)
+        logger.info("Riepilogo mattutino inviato alla chat %s (%d annunci)", chat_id, len(rows))
+
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job periodico: controlla tutte le ricerche attive e notifica i nuovi
-    annunci. Usa un unico VintedClient per l'intero ciclo, così i cookie di
-    sessione vengono riutilizzati invece di essere richiesti ad ogni ricerca."""
+    """Job periodico: controlla tutte le ricerche attive.
+
+    Fuori dalle ore silenziose, notifica subito i nuovi annunci (e prima
+    di tutto svuota eventuali riepiloghi rimasti in sospeso dalla notte).
+    Durante le ore silenziose, raccoglie gli annunci trovati senza
+    notificarli: verranno inviati come riepilogo al termine della notte.
+
+    Usa un unico VintedClient per l'intero ciclo, così i cookie di sessione
+    vengono riutilizzati invece di essere richiesti ad ogni ricerca.
+    """
+    quiet_now = is_quiet_hours()
+
+    if not quiet_now:
+        await _flush_pending_digests(context)
+
     searches = [s for s in storage.list_active_searches() if s.baseline_done]
     if not searches:
         return
@@ -245,24 +329,24 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     info = await vw.build_item_info(client, raw_item)
                     caption = vw.format_caption(info, search.name)
-                    if info.photo_url:
-                        await context.bot.send_photo(
-                            chat_id=search.chat_id,
-                            photo=info.photo_url,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=search.chat_id,
-                            text=caption,
-                            parse_mode=ParseMode.HTML,
-                        )
                 except Exception:
                     logger.exception(
-                        "Errore inviando la notifica per l'articolo %s", raw_item.get("id")
+                        "Errore recuperando i dettagli dell'articolo %s", raw_item.get("id")
                     )
-                await asyncio.sleep(1.5)  # non intasare Telegram
+                    continue
+
+                if quiet_now:
+                    storage.add_pending_item(
+                        chat_id=search.chat_id,
+                        search_name=search.name,
+                        item_id=info.item_id,
+                        photo_url=info.photo_url,
+                        caption=caption,
+                        price=info.price,
+                    )
+                else:
+                    await _send_item_notification(context, search.chat_id, info.photo_url, caption)
+                    await asyncio.sleep(1.5)  # non intasare Telegram
 
             # Piccola pausa "cortese" tra una ricerca e l'altra verso Vinted.
             await asyncio.sleep(random.uniform(2, 4))
@@ -281,7 +365,10 @@ def main() -> None:
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL_SECONDS, first=10)
 
-    logger.info("Bot avviato. Intervallo di polling: %ss", POLL_INTERVAL_SECONDS)
+    logger.info(
+        "Bot avviato. Intervallo di polling: %ss. Ore silenziose: %02d:00-%02d:00 (%s).",
+        POLL_INTERVAL_SECONDS, QUIET_HOURS_START, QUIET_HOURS_END, TIMEZONE,
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
