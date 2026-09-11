@@ -72,6 +72,13 @@ QUIET_HOURS_START = int(os.environ.get("QUIET_HOURS_START", "23"))  # 23 = 23:00
 QUIET_HOURS_END = int(os.environ.get("QUIET_HOURS_END", "9"))  # 9 = 09:00
 DIGEST_MAX_ITEMS = int(os.environ.get("DIGEST_MAX_ITEMS", "20"))
 
+# Timeout di sicurezza: la libreria che parla con Vinted non ha timeout
+# propri, quindi se una richiesta resta "appesa" il bot si bloccherebbe
+# per sempre. Questi limiti garantiscono che ogni ciclo si sblocchi da
+# solo anche in caso di problemi di rete.
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "25"))
+JOB_TIMEOUT_SECONDS = float(os.environ.get("JOB_TIMEOUT_SECONDS", "240"))
+
 VINTED_URL_RE = re.compile(r"https?://(www\.)?vinted\.[a-z.]+/catalog\?", re.IGNORECASE)
 
 storage = Storage(DB_PATH)
@@ -164,12 +171,21 @@ async def _baseline_new_searches(added: list[tuple[int, str]]) -> None:
     async with VintedClient(persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
         for search_id, search in searches.items():
             try:
-                raw_items = await vw.poll_search(client, search, ITEMS_PER_PAGE)
+                raw_items = await asyncio.wait_for(
+                    vw.poll_search(client, search, ITEMS_PER_PAGE),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
                 storage.mark_seen(search_id, [str(it.get("id")) for it in raw_items])
                 storage.mark_baseline_done(search_id)
                 logger.info(
                     "Baseline completata per ricerca #%s (%d annunci di partenza)",
                     search_id, len(raw_items),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timeout (%ss) nella baseline della ricerca #%s. "
+                    "Se non parte a notificare, prova a rimuoverla e riaggiungerla con /aggiungi.",
+                    REQUEST_TIMEOUT_SECONDS, search_id,
                 )
             except VintedError as exc:
                 logger.warning("Baseline fallita per ricerca #%s: %s", search_id, exc)
@@ -285,8 +301,8 @@ async def _flush_pending_digests(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Riepilogo mattutino inviato alla chat %s (%d annunci)", chat_id, len(rows))
 
 
-async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job periodico: controlla tutte le ricerche attive.
+async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Un singolo ciclo di controllo di tutte le ricerche attive.
 
     Fuori dalle ore silenziose, notifica subito i nuovi annunci (e prima
     di tutto svuota eventuali riepiloghi rimasti in sospeso dalla notte).
@@ -294,7 +310,10 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     notificarli: verranno inviati come riepilogo al termine della notte.
 
     Usa un unico VintedClient per l'intero ciclo, così i cookie di sessione
-    vengono riutilizzati invece di essere richiesti ad ogni ricerca.
+    vengono riutilizzati invece di essere richiesti ad ogni ricerca. Ogni
+    chiamata di rete verso Vinted è protetta da un timeout: la libreria
+    usata non ne ha uno proprio, quindi senza questa protezione una
+    richiesta che resta "appesa" bloccherebbe il bot indefinitamente.
     """
     quiet_now = is_quiet_hours()
 
@@ -308,7 +327,16 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     async with VintedClient(persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
         for search in searches:
             try:
-                raw_items = await vw.poll_search(client, search, ITEMS_PER_PAGE)
+                raw_items = await asyncio.wait_for(
+                    vw.poll_search(client, search, ITEMS_PER_PAGE),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timeout (%ss) interrogando la ricerca #%s, salto questo ciclo.",
+                    REQUEST_TIMEOUT_SECONDS, search.id,
+                )
+                continue
             except VintedRateLimitError:
                 logger.warning("Vinted ha limitato le richieste, salto questo ciclo e rallento.")
                 await asyncio.sleep(10)
@@ -327,8 +355,17 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             for raw_item in new_raw_items:
                 try:
-                    info = await vw.build_item_info(client, raw_item)
+                    info = await asyncio.wait_for(
+                        vw.build_item_info(client, raw_item),
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
                     caption = vw.format_caption(info, search.name)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timeout (%ss) sui dettagli dell'articolo %s, salto.",
+                        REQUEST_TIMEOUT_SECONDS, raw_item.get("id"),
+                    )
+                    continue
                 except Exception:
                     logger.exception(
                         "Errore recuperando i dettagli dell'articolo %s", raw_item.get("id")
@@ -346,10 +383,32 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                 else:
                     await _send_item_notification(context, search.chat_id, info.photo_url, caption)
-                    await asyncio.sleep(1.5)  # non intasare Telegram
+
+                # Pausa di cortesia dopo OGNI articolo elaborato, sia che sia
+                # stato notificato subito sia che sia stato solo accodato per
+                # il riepilogo: qui parte comunque una richiesta verso Vinted
+                # (i dettagli dell'articolo), quindi va sempre distanziata.
+                await asyncio.sleep(1.5)
 
             # Piccola pausa "cortese" tra una ricerca e l'altra verso Vinted.
             await asyncio.sleep(random.uniform(2, 4))
+
+
+async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Wrapper con "watchdog": garantisce che un ciclo di controllo non
+    possa mai bloccare il bot per sempre. Se qualcosa si blocca oltre
+    JOB_TIMEOUT_SECONDS (es. una richiesta di rete che non risponde né va
+    in errore), il ciclo viene interrotto e si riprova al prossimo giro,
+    invece di lasciare il bot silenzioso a tempo indeterminato."""
+    try:
+        await asyncio.wait_for(_run_poll_cycle(context), timeout=JOB_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            "Il ciclo di controllo ha superato %ss ed è stato interrotto. Riprovo al prossimo giro.",
+            JOB_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("Errore imprevisto nel ciclo di controllo periodico.")
 
 
 def main() -> None:
