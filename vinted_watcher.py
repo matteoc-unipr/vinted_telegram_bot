@@ -17,18 +17,51 @@ NOTE IMPORTANTI:
     dal metodo di spedizione scelto, quindi NON è sempre disponibile tramite
     l'API pubblica. Quando non lo troviamo, lo segnaliamo nel messaggio
     invece di inventarlo.
+
+PATCH ENDPOINT RICERCA (settembre 2026): verso metà settembre 2026 Vinted
+ha spostato l'endpoint di ricerca catalogo da
+    https://www.vinted.<tld>/api/v2/catalog/items
+a
+    https://api.vinted.<tld>/svc-catalogue/items
+cambiando anche il formato di alcuni parametri di filtro e richiedendo
+nuovi header (X-Anon-Id, X-Csrf-Token). La libreria "vinted-api-kit" (v1.0.0,
+gennaio 2026) non è ancora stata aggiornata per seguirlo, quindi qui sotto
+reimplementiamo SOLO la chiamata di ricerca, riusando l'autenticazione/
+sessione già gestita dalla libreria. Il recupero dei dettagli del singolo
+articolo (item_details) non risulta interessato da questo cambiamento e
+resta quindi invariato.
+ATTENZIONE: la mappatura di parametri/header qui sotto si basa su
+segnalazioni pubbliche di problemi analoghi su librerie simili, non su un
+test diretto contro Vinted (che da questo ambiente di sviluppo non è
+raggiungibile): è ragionevole aspettarsi di doverla affinare in base ai
+log reali.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from vinted import VintedClient
-from vinted.exceptions import VintedError
+from vinted.exceptions import VintedAPIError, VintedError, VintedNetworkError
 
 logger = logging.getLogger(__name__)
+
+_CSRF_META_RE = re.compile(
+    r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE
+)
+
+# Parametri che nel nuovo endpoint sono stati spostati sotto attribute_ids[...].
+# Confermato solo per catalog_ids/brand_ids dalle segnalazioni disponibili;
+# gli altri filtri (size_ids, status_ids, price_*, ...) restano con lo
+# stesso nome per ora.
+_ATTRIBUTE_KEY_MAP = {
+    "catalog_ids": "attribute_ids[catalog]",
+    "brand_ids": "attribute_ids[brand]",
+}
 
 
 @dataclass
@@ -91,9 +124,135 @@ async def poll_search(client: VintedClient, search, per_page: int = 20) -> list[
     """Interroga una ricerca e restituisce la lista grezza (dict) di articoli
     trovati in pagina 1, nell'ordine restituito da Vinted. Se l'URL della
     ricerca contiene già order=newest_first (consigliato), saranno ordinati
-    dal più recente."""
-    items = await client.search_items(url=search.url, per_page=per_page, raw_data=True)
+    dal più recente.
+
+    NOTA: usa _patched_catalog_search invece del metodo search_items della
+    libreria, perché quest'ultimo punta a un endpoint che Vinted ha
+    dismesso a metà settembre 2026 (vedi note a inizio file)."""
+    items = await _patched_catalog_search(client, search.url, per_page=per_page)
     return items or []
+
+
+async def _patched_catalog_search(
+    client: VintedClient, search_url: str, per_page: int = 20, page: int = 1
+) -> list[dict[str, Any]]:
+    """Cerca nel catalogo Vinted usando il nuovo endpoint svc-catalogue,
+    riusando la sessione/i cookie già autenticati e gestiti da VintedClient
+    (accediamo ad attributi "privati" della libreria di proposito: sono
+    già stati testati per costruire la richiesta all'endpoint vecchio, e
+    qui li riusiamo solo per ricostruire parametri e sessione)."""
+    http_session = client._session
+    catalog_api = client._catalog
+
+    http_session.configure_from_url(search_url)
+
+    old_params = catalog_api._build_params(search_url, per_page=per_page, page=page)
+    old_params["time"] = int(time.time())
+
+    new_params: dict[str, Any] = {}
+    for key, value in old_params.items():
+        new_params[_ATTRIBUTE_KEY_MAP.get(key, key)] = value
+
+    locale = http_session.locale or "com"
+    new_url = f"https://api.vinted.{locale}/svc-catalogue/items"
+
+    extra_headers: dict[str, str] = {}
+    anon_id = _extract_anon_id(http_session)
+    if anon_id:
+        extra_headers["X-Anon-Id"] = anon_id
+    csrf_token = await _extract_csrf_token(http_session)
+    if csrf_token:
+        extra_headers["X-Csrf-Token"] = csrf_token
+
+    logger.debug(
+        "svc-catalogue: richiesta url=%s params=%s header_extra=%s",
+        new_url, new_params, list(extra_headers.keys()),
+    )
+
+    try:
+        response = await http_session.session.get(
+            new_url, params=new_params, headers=extra_headers, impersonate="chrome", verify=True,
+        )
+    except Exception as exc:
+        raise VintedNetworkError("Errore di rete su svc-catalogue", exc) from exc
+
+    if response.status_code >= 400:
+        snippet = _safe_snippet(response)
+        logger.warning(
+            "svc-catalogue ha risposto %s per %s | header inviati: %s | corpo: %s",
+            response.status_code, getattr(response, "url", new_url),
+            list(extra_headers.keys()), snippet,
+        )
+        raise VintedAPIError(
+            f"HTTP {response.status_code} da svc-catalogue",
+            status_code=response.status_code, response=response,
+        )
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        logger.warning("svc-catalogue: 200 OK ma corpo non-JSON: %s", _safe_snippet(response))
+        raise VintedAPIError(
+            "Risposta non valida da svc-catalogue", status_code=response.status_code, response=response,
+        ) from exc
+
+    items = data.get("items") if isinstance(data, dict) else None
+    if items is None:
+        # La forma della risposta potrebbe essere cambiata rispetto al
+        # vecchio endpoint: logghiamo le chiavi di primo livello per
+        # capire come adattare il parsing in un prossimo aggiustamento.
+        logger.warning(
+            "svc-catalogue: 200 OK ma nessuna chiave 'items' nella risposta. Chiavi presenti: %s",
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        )
+        items = []
+    else:
+        logger.info("svc-catalogue: trovati %d articoli per %s", len(items), search_url)
+
+    return items
+
+
+def _safe_snippet(response) -> str:
+    try:
+        text = response.text or ""
+    except Exception:
+        return "(corpo non leggibile)"
+    return " ".join(text.split())[:300]
+
+
+def _extract_anon_id(http_session) -> Optional[str]:
+    try:
+        for cookie in http_session.session.cookies.jar:
+            name = (getattr(cookie, "name", "") or "").lower()
+            if "anon" in name:
+                return cookie.value
+    except Exception:
+        logger.debug("Impossibile leggere i cookie per cercare l'anon id", exc_info=True)
+    return None
+
+
+async def _extract_csrf_token(http_session) -> Optional[str]:
+    """Il token CSRF non è nei cookie: proviamo a estrarlo dal tag meta
+    standard di Rails nella home page di Vinted, e lo mettiamo in cache
+    sull'oggetto sessione per non rifare questa richiesta extra ad ogni
+    singola ricerca dello stesso ciclo."""
+    cached = getattr(http_session, "_patched_csrf_token", None)
+    if cached:
+        return cached
+    if not http_session.base_url:
+        return None
+    try:
+        resp = await http_session.session.get(
+            http_session.base_url, impersonate="chrome", verify=True
+        )
+    except Exception:
+        logger.debug("Impossibile recuperare la home page per il csrf-token", exc_info=True)
+        return None
+    match = _CSRF_META_RE.search(resp.text or "")
+    token = match.group(1) if match else None
+    if token:
+        http_session._patched_csrf_token = token
+    return token
 
 
 def extract_new_item_dicts(raw_items: list[dict], seen_ids: set[str]) -> list[dict]:
