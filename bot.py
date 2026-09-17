@@ -79,6 +79,19 @@ DIGEST_MAX_ITEMS = int(os.environ.get("DIGEST_MAX_ITEMS", "20"))
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "25"))
 JOB_TIMEOUT_SECONDS = float(os.environ.get("JOB_TIMEOUT_SECONDS", "240"))
 
+# Se TUTTE le ricerche falliscono per questo numero di cicli consecutivi,
+# è quasi certamente un problema di sessione/cookie con Vinted (non delle
+# singole ricerche): il bot cancella i cookie salvati e forza una nuova
+# sessione pulita al ciclo successivo, senza bisogno di un riavvio manuale.
+FULL_FAILURE_THRESHOLD = int(os.environ.get("FULL_FAILURE_THRESHOLD", "3"))
+
+# Proxy opzionale (formato host:porta, senza schema) da passare a Vinted.
+# Utile solo se i blocchi anti-bot persistono nonostante l'auto-guarigione:
+# in quel caso serve un proxy residenziale a pagamento, non uno gratuito.
+PROXY = os.environ.get("PROXY", "").strip() or None
+
+_consecutive_full_failures = 0
+
 VINTED_URL_RE = re.compile(r"https?://(www\.)?vinted\.[a-z.]+/catalog\?", re.IGNORECASE)
 
 storage = Storage(DB_PATH)
@@ -168,7 +181,7 @@ def _guess_name(url: str) -> str:
 async def _baseline_new_searches(added: list[tuple[int, str]]) -> None:
     ids = {sid for sid, _ in added}
     searches = {s.id: s for s in storage.list_active_searches() if s.id in ids}
-    async with VintedClient(persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
+    async with VintedClient(proxy=PROXY, persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
         for search_id, search in searches.items():
             try:
                 raw_items = await asyncio.wait_for(
@@ -301,6 +314,25 @@ async def _flush_pending_digests(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Riepilogo mattutino inviato alla chat %s (%d annunci)", chat_id, len(rows))
 
 
+def _reset_vinted_session() -> None:
+    """Cancella i cookie salvati su disco per forzare una sessione
+    completamente nuova con Vinted al prossimo ciclo. Va chiamata quando
+    tutte le ricerche falliscono per più cicli di fila: è il sintomo di
+    una sessione/cookie diventata non valida (es. dopo ore di polling
+    continuo), non di un problema con le singole ricerche."""
+    logger.warning(
+        "Troppi cicli falliti di fila (%d): elimino i cookie salvati per "
+        "forzare una nuova sessione pulita con Vinted.",
+        FULL_FAILURE_THRESHOLD,
+    )
+    try:
+        if COOKIES_DIR.exists():
+            for f in COOKIES_DIR.glob("*"):
+                f.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("Errore eliminando i cookie salvati in %s", COOKIES_DIR)
+
+
 async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Un singolo ciclo di controllo di tutte le ricerche attive.
 
@@ -324,7 +356,9 @@ async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not searches:
         return
 
-    async with VintedClient(persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
+    async with VintedClient(proxy=PROXY, persist_cookies=True, cookies_dir=COOKIES_DIR) as client:
+        success_count = 0
+        fail_count = 0
         for search in searches:
             try:
                 raw_items = await asyncio.wait_for(
@@ -336,14 +370,19 @@ async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "Timeout (%ss) interrogando la ricerca #%s, salto questo ciclo.",
                     REQUEST_TIMEOUT_SECONDS, search.id,
                 )
+                fail_count += 1
                 continue
             except VintedRateLimitError:
                 logger.warning("Vinted ha limitato le richieste, salto questo ciclo e rallento.")
+                fail_count += 1
                 await asyncio.sleep(10)
                 continue
             except VintedError as exc:
                 logger.warning("Errore interrogando la ricerca #%s: %s", search.id, exc)
+                fail_count += 1
                 continue
+
+            success_count += 1
 
             all_ids = [str(it.get("id")) for it in raw_items]
             seen_ids = storage.get_seen_ids(search.id, all_ids)
@@ -392,6 +431,20 @@ async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # Piccola pausa "cortese" tra una ricerca e l'altra verso Vinted.
             await asyncio.sleep(random.uniform(2, 4))
+
+    global _consecutive_full_failures
+    if fail_count > 0 and success_count == 0:
+        _consecutive_full_failures += 1
+        logger.warning(
+            "Tutte le %d ricerche sono fallite in questo ciclo (fallimenti "
+            "pieni consecutivi: %d/%d).",
+            fail_count, _consecutive_full_failures, FULL_FAILURE_THRESHOLD,
+        )
+        if _consecutive_full_failures >= FULL_FAILURE_THRESHOLD:
+            _reset_vinted_session()
+            _consecutive_full_failures = 0
+    else:
+        _consecutive_full_failures = 0
 
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
