@@ -94,6 +94,31 @@ _consecutive_full_failures = 0
 
 VINTED_URL_RE = re.compile(r"https?://(www\.)?vinted\.[a-z.]+/catalog\?", re.IGNORECASE)
 
+
+def _describe_vinted_error(exc: Exception) -> str:
+    """Arricchisce il messaggio di un errore Vinted con l'URL esattamente
+    richiesto e un pezzo del corpo della risposta, quando disponibili.
+    Fondamentale per capire SE Vinted sta rispondendo con una pagina
+    anti-bot, un errore applicativo, o altro, invece del solo codice HTTP."""
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is None:
+        return " | ".join(parts)
+
+    url = getattr(response, "url", None)
+    if url:
+        parts.append(f"URL: {url}")
+
+    try:
+        text = response.text
+    except Exception:
+        text = None
+    if text:
+        snippet = " ".join(text.split())[:300]
+        parts.append(f"Risposta: {snippet}")
+
+    return " | ".join(parts)
+
 storage = Storage(DB_PATH)
 
 
@@ -201,7 +226,10 @@ async def _baseline_new_searches(added: list[tuple[int, str]]) -> None:
                     REQUEST_TIMEOUT_SECONDS, search_id,
                 )
             except VintedError as exc:
-                logger.warning("Baseline fallita per ricerca #%s: %s", search_id, exc)
+                logger.warning(
+                    "Baseline fallita per ricerca #%s: %s",
+                    search_id, _describe_vinted_error(exc),
+                )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -378,7 +406,10 @@ async def _run_poll_cycle(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await asyncio.sleep(10)
                 continue
             except VintedError as exc:
-                logger.warning("Errore interrogando la ricerca #%s: %s", search.id, exc)
+                logger.warning(
+                    "Errore interrogando la ricerca #%s: %s",
+                    search.id, _describe_vinted_error(exc),
+                )
                 fail_count += 1
                 continue
 
