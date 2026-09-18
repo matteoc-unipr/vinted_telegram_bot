@@ -39,6 +39,7 @@ log reali.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -156,7 +157,12 @@ async def _patched_catalog_search(
     locale = http_session.locale or "com"
     new_url = f"https://api.vinted.{locale}/svc-catalogue/items"
 
-    extra_headers: dict[str, str] = {}
+    extra_headers: dict[str, str] = {
+        # Il nuovo endpoint potrebbe non dedurre più il paese dal dominio
+        # come faceva quello vecchio (specie chiamandolo da un server negli
+        # USA): dichiariamo esplicitamente la localizzazione italiana.
+        "Accept-Language": f"{locale}-{locale.upper()},{locale};q=0.9",
+    }
     anon_id = _extract_anon_id(http_session)
     if anon_id:
         extra_headers["X-Anon-Id"] = anon_id
@@ -208,6 +214,14 @@ async def _patched_catalog_search(
         items = []
     else:
         logger.info("svc-catalogue: trovati %d articoli per %s", len(items), search_url)
+        if items:
+            # Diagnostica: mostriamo il primo articolo così com'è, per
+            # capire se lo schema dei campi (url, prezzo, paese venditore,
+            # ecc.) è cambiato rispetto al vecchio endpoint.
+            logger.info(
+                "svc-catalogue: esempio primo articolo (per diagnosi): %s",
+                _safe_json_snippet(items[0]),
+            )
 
     return items
 
@@ -218,6 +232,14 @@ def _safe_snippet(response) -> str:
     except Exception:
         return "(corpo non leggibile)"
     return " ".join(text.split())[:300]
+
+
+def _safe_json_snippet(obj: Any, max_len: int = 800) -> str:
+    try:
+        text = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        text = str(obj)
+    return text[:max_len]
 
 
 def _extract_anon_id(http_session) -> Optional[str]:
@@ -263,6 +285,29 @@ def extract_new_item_dicts(raw_items: list[dict], seen_ids: set[str]) -> list[di
     return list(reversed(new_items))  # Vinted li restituisce dal più recente al più vecchio
 
 
+def _absolute_item_url(client: VintedClient, raw_url: str, item_id: str, title: str) -> str:
+    """Garantisce un link assoluto e funzionante all'annuncio, anche se il
+    nuovo endpoint restituisce un percorso relativo o nessun link affatto."""
+    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+        return raw_url
+
+    try:
+        base = (client._session.base_url or "").rstrip("/")
+    except Exception:
+        base = ""
+
+    if raw_url:
+        path = raw_url if raw_url.startswith("/") else f"/{raw_url}"
+        return f"{base}{path}"
+
+    if item_id and item_id != "None" and base:
+        # Gli URL articolo di Vinted funzionano anche senza lo slug testuale
+        # dopo l'id (es. /items/123 invece di /items/123-nome-articolo).
+        return f"{base}/items/{item_id}"
+
+    return raw_url  # nessun modo di costruire un link valido, resta vuoto
+
+
 async def build_item_info(client: VintedClient, raw_item: dict) -> ItemInfo:
     """Arricchisce un articolo trovato in catalogo con i dettagli (tasse,
     prezzo totale, eventuale stima di spedizione) leggendo la pagina
@@ -270,7 +315,7 @@ async def build_item_info(client: VintedClient, raw_item: dict) -> ItemInfo:
     solo per i nuovi articoli, non per l'intero catalogo ad ogni ciclo."""
     item_id = str(raw_item.get("id"))
     title = raw_item.get("title") or "(senza titolo)"
-    url = raw_item.get("url") or ""
+    url = _absolute_item_url(client, raw_item.get("url") or "", item_id, title)
     brand = raw_item.get("brand_title") or ""
     size = raw_item.get("size_title") or ""
 
