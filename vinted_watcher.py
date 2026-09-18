@@ -170,6 +170,20 @@ async def _patched_catalog_search(
     if csrf_token:
         extra_headers["X-Csrf-Token"] = csrf_token
 
+    # api.vinted.<tld> è un sottodominio diverso da www.vinted.<tld>, dove
+    # sono stati ottenuti i cookie di sessione: se quei cookie hanno un
+    # Domain ristretto a www, il jar automatico del client NON li invia
+    # qui, rendendo la richiesta di fatto anonima (spiegherebbe il
+    # catalogo/valuta sbagliati visti nei log). Li alleghiamo a mano.
+    cookie_domains = _log_cookie_domains(http_session)
+    cookie_header = _cookie_header_from_jar(http_session)
+    if cookie_header:
+        extra_headers["Cookie"] = cookie_header
+
+    logger.info(
+        "svc-catalogue: domini cookie disponibili=%s, cookie allegati manualmente=%s",
+        cookie_domains, bool(cookie_header),
+    )
     logger.debug(
         "svc-catalogue: richiesta url=%s params=%s header_extra=%s",
         new_url, new_params, list(extra_headers.keys()),
@@ -215,12 +229,14 @@ async def _patched_catalog_search(
     else:
         logger.info("svc-catalogue: trovati %d articoli per %s", len(items), search_url)
         if items:
-            # Diagnostica: mostriamo il primo articolo così com'è, per
-            # capire se lo schema dei campi (url, prezzo, paese venditore,
-            # ecc.) è cambiato rispetto al vecchio endpoint.
+            # Diagnostica: mostriamo il primo articolo così com'è (con le
+            # miniature della foto accorciate, che altrimenti da sole
+            # riempiono il limite del log e nascondono gli altri campi),
+            # per capire se lo schema è cambiato rispetto al vecchio
+            # endpoint (es. url, prezzo, paese/valuta venditore).
             logger.info(
                 "svc-catalogue: esempio primo articolo (per diagnosi): %s",
-                _safe_json_snippet(items[0]),
+                _safe_json_snippet(_slim_item_for_log(items[0]), max_len=3000),
             )
 
     return items
@@ -240,6 +256,39 @@ def _safe_json_snippet(obj: Any, max_len: int = 800) -> str:
     except Exception:
         text = str(obj)
     return text[:max_len]
+
+
+def _slim_item_for_log(item: dict) -> dict:
+    """Copia dell'articolo per il solo log diagnostico, con l'eventuale
+    lista di miniature della foto accorciata: da sola può occupare gran
+    parte del limite di lunghezza del log, nascondendo gli altri campi
+    (prezzo, url, ecc.) che vengono dopo nel JSON."""
+    slim = dict(item)
+    photo = slim.get("photo")
+    if isinstance(photo, dict) and isinstance(photo.get("thumbnails"), list):
+        slim["photo"] = {**photo, "thumbnails": f"[{len(photo['thumbnails'])} miniature omesse]"}
+    return slim
+
+
+def _log_cookie_domains(http_session) -> list[str]:
+    try:
+        return sorted({getattr(c, "domain", "?") or "?" for c in http_session.session.cookies.jar})
+    except Exception:
+        logger.debug("Impossibile leggere i domini dei cookie", exc_info=True)
+        return []
+
+
+def _cookie_header_from_jar(http_session) -> str:
+    """Costruisce a mano un header Cookie con tutti i cookie della sessione,
+    per garantire che vengano inviati anche al sottodominio api.vinted.<tld>
+    anche se il loro Domain originale è ristretto a www.vinted.<tld> (in tal
+    caso il cookie jar automatico non li invierebbe a un host diverso)."""
+    try:
+        pairs = [f"{c.name}={c.value}" for c in http_session.session.cookies.jar if c.name and c.value]
+        return "; ".join(pairs)
+    except Exception:
+        logger.debug("Impossibile costruire l'header Cookie manuale", exc_info=True)
+        return ""
 
 
 def _extract_anon_id(http_session) -> Optional[str]:
@@ -331,7 +380,13 @@ async def build_item_info(client: VintedClient, raw_item: dict) -> ItemInfo:
             price = 0.0
 
     photo_data = raw_item.get("photo") or {}
-    photo_url = photo_data.get("url", "") if isinstance(photo_data, dict) else str(photo_data or "")
+    if isinstance(photo_data, dict):
+        # Il nuovo endpoint (settembre 2026) chiama il campo "full_size_url"
+        # invece del vecchio "url"; teniamo comunque "url" come ripiego nel
+        # caso torni a cambiare ancora.
+        photo_url = photo_data.get("full_size_url") or photo_data.get("url") or ""
+    else:
+        photo_url = str(photo_data or "")
 
     total_price: Optional[float] = None
     service_fee: Optional[float] = None
